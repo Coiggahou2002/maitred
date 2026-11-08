@@ -446,7 +446,7 @@ def cmd_run(argv):
                     ahead = next(i for i, t in enumerate(queue) if t["pid"] == os.getpid())
                     reason = f"{ahead} job(s) ahead in the queue"
             now = time.time()
-            if now - said >= 30:
+            if now - started >= 2 and now - said >= 30:
                 sys.stderr.write(f"[maitred] waiting {int(now - started)}s — {reason}"
                                  " (`maitred status`)\n")
                 sys.stderr.flush()
@@ -773,6 +773,8 @@ def install_claude_code_hook(src):
     if os.path.exists(settings):
         with open(settings) as f, open(settings + ".bak-maitred", "w") as b:
             b.write(f.read())
+    else:
+        write_json(path("created-settings"), {"path": settings})
     groups.append({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]})
     os.makedirs(os.path.dirname(settings), exist_ok=True)
     with open(settings, "w") as f:
@@ -834,12 +836,24 @@ def remove_claude_code_hook():
     kept = [g for g in groups
             if not any("claude_code_hook.py" in h.get("command", "") and "maitred" in h.get("command", "")
                        for h in g.get("hooks", []))]
-    if len(kept) != len(groups):
+    if len(kept) == len(groups):
+        return
+    created = (read_json(path("created-settings"), {}) or {}).get("path") == settings
+    if kept:
         data["hooks"]["PreToolUse"] = kept
-        with open(settings, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        print(f"claude code: hook removed from {settings}")
+    else:
+        del data["hooks"]["PreToolUse"]
+        if not data["hooks"]:
+            del data["hooks"]
+    if created and not data:
+        os.unlink(settings)
+        os.unlink(path("created-settings"))
+        print(f"claude code: removed {settings} (install had created it)")
+        return
+    with open(settings, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print(f"claude code: hook removed from {settings}")
 
 
 def cmd_uninstall():
@@ -852,7 +866,11 @@ def cmd_uninstall():
     if os.path.islink(link):
         os.unlink(link)
         print(f"removed {link}")
-    print(f"left in place: your checkout, settings in {os.path.dirname(CONFIG_PATH)}, history in {HOME}")
+    logf = os.path.expanduser("~/Library/Logs/maitred.log")
+    if os.path.exists(logf):
+        os.unlink(logf)
+    kept = [HOME] + ([CONFIG_PATH] if os.path.exists(CONFIG_PATH) else [])
+    print(f"left in place: this checkout, {', '.join(kept)} (delete by hand if you want them gone)")
     return 0
 
 
@@ -873,7 +891,7 @@ def main(argv):
         return cmd_install(rest)
     if cmd == "uninstall":
         return cmd_uninstall()
-    if cmd == "--version":
+    if cmd in ("--version", "version"):
         print(VERSION)
         return 0
     # `maitred <cmd…>` is shorthand for `maitred run -- <cmd…>`

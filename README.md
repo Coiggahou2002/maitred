@@ -26,7 +26,9 @@ ship is enough), no dependencies. What `install` does, so nothing is a surprise:
   sessions pick it up; running ones need a restart.
 
 All three point at the clone, so keep it where it is — after moving it, run `install` again.
-`maitred uninstall` removes the guard, the link and the hook; it leaves your settings and history.
+`maitred uninstall` removes the guard, the link, the hook and `~/Library/Logs/maitred.log`
+(and `settings.json` itself if install created it); it leaves the clone, `~/.config/maitred` and
+the learned history in `~/.local/state/maitred`.
 
 ## What it does
 
@@ -54,12 +56,14 @@ room for it. Jobs go in first-come, first-served order.
 
 **2. A memory guard.** A LaunchAgent checks once a second. It measures memory the way macOS does:
 `phys_footprint` per process (the figure Activity Monitor and the out-of-memory dialog show), and
-free memory from `vm_stat` together with the kernel's `memorystatus_level`.
+free memory as the smaller of two figures `status` shows: the kernel's `memorystatus_level`
+("kernel", which lags) and a live one from `vm_stat` ("strict"). Every "% free" below is that
+smaller figure. When several rules apply, the first row that matches wins.
 
 | when | it does |
 |---|---|
-| one process started by an agent app grows past 22 % of RAM | kills it and sends a notification. A test runner at 246 GB is never legitimate |
 | one queued job's whole process tree passes 30 % of RAM | kills it, and the job says why |
+| one process started by an agent app grows past 22 % of RAM | kills it and sends a notification. A test runner at 246 GB is never legitimate |
 | everything agents started passes its budget (40 % of RAM), or the Mac drops below 15 % free | pauses the newest job (`SIGSTOP`) and starts nothing new |
 | work falls back under 85 % of budget and the Mac is above 25 % free | resumes the paused job |
 | a job stays paused for 3 minutes and memory never comes back | kills it, so it stops holding memory |
@@ -97,13 +101,13 @@ maitred run [--mem 4G] [--cpu 8] [--name X] -- <cmd…>   queue a command
 maitred status                                          memory, budget, jobs, recent actions
 maitred report [--days 7]                               did it work? guard actions per day, and how often macOS ran out of memory or was force-restarted
 maitred install [--claude-code]                         CLI + guard (+ Claude Code hook)
-maitred uninstall                                       remove the guard
+maitred uninstall                                       remove the guard, the link, the hook and the log
 ```
 
 `--name` is the key maitred learns memory under; by default it is the command's first words plus
 the directory, so `pytest tests/unit` and `pytest tests/` are learned separately. `maitred <cmd…>`
-is shorthand for `maitred run -- <cmd…>` (except for the words `run`, `status`, `install`,
-`uninstall`).
+is shorthand for `maitred run -- <cmd…>`, except for maitred's own subcommands (`run`, `status`,
+`report`, `install`, `uninstall`, `daemon`, `version`).
 
 To check that the guard is alive, look for `guard running` in `maitred status`, or run
 `launchctl list dev.maitred.guard`. Its log is `~/.local/state/maitred/events.log`.
