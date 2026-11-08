@@ -1,126 +1,142 @@
-# headroom
+# maitred
 
 **Your Mac stops freezing when AI agents work on it.**
 
-A laptop used to carry one person's worth of work. Now it carries ten coding agents, each of which
-can start a test suite, a build, a headless browser. Together they take every core and every
-gigabyte, macOS starts killing apps ("Your system has run out of application memory — Claude is
-using 64 GB"), and the only way out is a hard reboot.
+A laptop used to carry one person's worth of work. Now it carries ten coding agents, and each of
+them can start a test suite, a build or a headless browser. Together they take every core and
+every gigabyte. macOS starts killing apps ("Your system has run out of application memory —
+Claude is using 64 GB"), and the only way out is a hard reboot.
 
-headroom is a queue for heavy work plus a guard for memory. Install it once; afterwards the only
-thing you notice is that the machine doesn't lock up.
+maitred is the maître d' for that machine. Heavy work waits at the door until there is a table
+free, and anything that grows wild gets shown out before it takes the room down. You install it
+once. After that, the only thing you notice is that the Mac doesn't lock up.
 
 ```
-headroom install            # one time: CLI + background guard (a LaunchAgent)
-headroom run -- npm test    # waits for room, then runs at low priority
-headroom status             # what's running, paused, queued, and what the guard did
+git clone https://github.com/Coiggahou2002/maitred ~/maitred
+~/maitred/maitred install --claude-code
 ```
+
+That's the whole setup. macOS 12+, the system `python3`, no dependencies.
 
 ## What it does
 
-**1. Queue (admission).** `headroom run -- <cmd>` starts the command only when the machine has
-room for it, first come first served:
+**1. A queue for heavy work.** `maitred run -- <cmd>` starts a command only when the machine has
+room for it. Jobs go in first-come, first-served order.
 
-- CPU: each job reserves cores (default: half the machine). Jobs that don't fit wait.
-- Memory: each job reserves memory. The reservation starts from a prior (`--mem`, default 2 GB)
-  and is raised to what that same command actually peaked at last time — headroom measures it,
-  you never have to.
-- It starts nothing new while the Mac is short on memory or a job is paused.
-- The job runs at `nice +10`, so whatever you are clicking on stays fast.
+- **CPU.** Each job reserves cores (half the machine by default). A job that doesn't fit waits.
+- **Memory.** Each job reserves memory. The reservation starts from a prior (`--mem`, default
+  2 GB). maitred measures what that same command actually peaked at, and raises the next
+  reservation to match. You never have to estimate anything.
+- **Priority.** Jobs run at `nice +10`, so whatever you are clicking on stays fast.
+- **Hands-free with Claude Code.** With `--claude-code`, every heavy shell command an agent runs
+  goes through the queue automatically: pytest, npm/pnpm/yarn test and build, vitest, jest,
+  playwright, tsc, mypy, docker build, xcodebuild, swift, cargo, go, make, gradle.
 
-**2. Guard (enforcement).** A LaunchAgent checks once a second, using the same numbers macOS uses
-(per-process `phys_footprint`, which is what Activity Monitor and the "out of memory" dialog show,
-and the kernel's `memorystatus_level`):
+**2. A memory guard.** A LaunchAgent checks once a second. It measures memory the way macOS does:
+`phys_footprint` per process (the figure Activity Monitor and the out-of-memory dialog show), and
+free memory from `vm_stat` together with the kernel's `memorystatus_level`.
 
-| situation | action |
+| when | it does |
 |---|---|
-| a single process an agent app started grows past 22 % of RAM | killed, with a notification — a test runner at 246 GB is never legitimate |
-| a queued job's whole process tree passes 30 % of RAM | killed; the job prints why |
-| agents together pass their budget (55 % of RAM) or the Mac drops below 20 % free | newest job paused (`SIGSTOP`) |
-| memory comes back (agents < 85 % of budget and > 35 % free) | paused job resumed |
-| a job stays paused 3 minutes without memory coming back | killed, so it stops holding memory |
-| agents pass 115 % of budget | largest queued job killed |
-| the Mac drops below 10 % free or the kernel reports critical pressure | largest thing any agent started (≥ 1 GB) killed |
+| one process started by an agent app grows past 22 % of RAM | kills it and sends a notification. A test runner at 246 GB is never legitimate |
+| one queued job's whole process tree passes 30 % of RAM | kills it, and the job says why |
+| everything agents started passes its budget (40 % of RAM), or the Mac drops below 15 % free | pauses the newest job (`SIGSTOP`) and starts nothing new |
+| work falls back under 85 % of budget and the Mac is above 25 % free | resumes the paused job |
+| a job stays paused for 3 minutes and memory never comes back | kills it, so it stops holding memory |
+| agent work passes 115 % of budget | kills enough of the largest agent tasks, queued or not, to get back under budget in one step |
+| the Mac drops below 8 % free, or the kernel reports critical pressure | kills the largest things agents started, 1 GB and up |
 
-"Agent apps" are Claude, Claude Code, Cursor, Codex, Windsurf, Paseo, opencode, gemini, aider.
-The apps themselves are never paused or killed — only what they spawned. Every action is logged
-and shown by `headroom status`; a killed job exits 137 and says why on stderr, so the agent that
-ran it can read the reason and retry later.
+"Agent apps" means Claude, Claude Code, Cursor, Codex, Windsurf, Paseo, opencode, gemini and
+aider. maitred never pauses or kills the apps themselves, only what they spawned, so your
+sessions survive.
 
-## Install
+When the guard kills a job, the job exits with code 137 and prints the reason on stderr. The agent
+that ran it can read that reason and try again later. `maitred status` shows what is running,
+paused and queued, and what the guard did recently.
 
-macOS 12+, the system `python3`, nothing else.
+## Measured
+
+These numbers come from a 48 GB M-series Mac with the real guard and default settings
+(`tests/storm.py`-style run). The load was six queued jobs that each needed 4 GB, plus four
+processes outside the queue that each grew to 5 GB. That is about 44 GB of incompressible demand.
+
+| | |
+|---|---|
+| peak memory used by agent work | 24.8 GB (budget 19.2 GB, enforcement starts at 22 GB) |
+| lowest free memory on the Mac | 19 % |
+| memory pressure | normal throughout |
+| worst scheduling hiccup for a 100 ms timer | 10 ms |
+| outcome | 4 queued jobs finished after waiting their turn; the guard stopped 2 queued jobs and 2 runaway processes |
+
+A single 12 GB process started outside the queue was killed 1 s after it crossed the limit.
+
+## Commands
 
 ```
-git clone https://github.com/<you>/headroom ~/headroom
-~/headroom/headroom install
+maitred run [--mem 4G] [--cpu 8] [--name X] -- <cmd…>   queue a command (or: maitred <cmd…>)
+maitred status                                          memory, budget, jobs, recent actions
+maitred install [--claude-code]                         CLI + guard (+ Claude Code hook)
+maitred uninstall                                       remove the guard
 ```
 
-`install` links the CLI into `~/.local/bin` and loads `~/Library/LaunchAgents/dev.headroom.guard.plist`
-(starts at login, restarts if it dies). `headroom uninstall` removes the guard.
+To check that the guard is alive, look for `guard running` in `maitred status`, or run
+`launchctl list dev.maitred.guard`. Its log is `~/.local/state/maitred/events.log`.
 
-Check it is alive: `headroom status` (line `guard running`) or `launchctl list dev.headroom.guard`.
-
-## Claude Code
-
-Agents shouldn't have to remember a wrapper. Add the bundled hook and every heavy command
-(pytest, npm test/build, vitest, playwright, tsc, mypy, docker build, xcodebuild, cargo, go, make …)
-is routed through the queue automatically:
-
-```jsonc
-// ~/.claude/settings.json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "Bash",
-        "hooks": [{ "type": "command",
-                    "command": "python3 ~/headroom/integrations/claude_code_hook.py" }] }
-    ]
-  }
-}
-```
-
-Other agents: prefix heavy commands with `headroom run --`, or point their command hook at the
-same script. Nested calls (a `headroom run` inside a job) don't queue twice.
+Other agent tools can prefix heavy commands with `maitred run --`, or point their own command
+hook at `integrations/claude_code_hook.py`. A `maitred run` inside a job doesn't queue a second
+time.
 
 ## Configuration
 
-Optional. `~/.config/headroom/config.json`, re-read every second, or `HEADROOM_<KEY>` env vars:
+Configuration is optional. Settings go in `~/.config/maitred/config.json`, which is re-read every
+second, or in `MAITRED_<KEY>` environment variables:
 
 ```json
 {
-  "agent_budget_pct": 55,
+  "agent_budget_pct": 40,
   "runaway_pct": 22,
   "job_cap_pct": 30,
-  "soft_pct": 20, "resume_pct": 35, "hard_pct": 10,
-  "admit_floor_pct": 25,
+  "soft_pct": 15, "resume_pct": 25, "hard_pct": 8,
+  "admit_floor_pct": 20,
   "default_cpu": 8, "default_mem_gb": 2,
   "pause_max_s": 180,
-  "notify": true,
-  "hosts": ["/Claude\\.app/", "/Cursor\\.app/", "..."]
+  "notify": true
 }
 ```
 
-## Limits — read before trusting it
+## Limits
 
-- **It is a user-space guard, not a kernel limit.** macOS has no cgroups. headroom polls once a
-  second; a process that allocates faster than ~10 GB/s can briefly overshoot before it is killed.
-- **Docker's VM is outside it.** Containers live in one VM process whose size you set in Docker
-  Desktop → Resources. Lower that if Docker is your biggest consumer.
-- **Pausing does not free memory**, it stops growth and lets macOS compress the paused pages. That
+- **It is a user-space guard, not a kernel limit.** macOS has no cgroups. The guard looks once a
+  second, so memory that grows faster than that overshoots by about one second's worth before it
+  is stopped (2.8 GB in the run above).
+- **Docker's VM is outside it.** Containers live inside one VM process whose size you set in
+  Docker Desktop → Resources. If Docker is your biggest memory user, lower that setting.
+- **Pausing does not free memory.** It stops growth and lets macOS compress the paused pages. That
   is why a pause that doesn't help turns into a kill after `pause_max_s`.
-- **Only jobs started through `headroom run` are queued.** Everything else is only protected by the
-  runaway and emergency rules.
-- **A kill is a kill.** The guard never touches the agent apps, but it will end a test run. That is
-  the trade: one failed run with a clear reason instead of a frozen machine.
+- **Only `maitred run` jobs wait in the queue.** Everything else is covered only by the runaway,
+  budget and emergency rules.
+- **A kill is a kill.** The guard can end a test run. That is the trade: one failed run with a
+  clear reason, instead of a frozen machine.
+
+## Related projects
+
+- [aha-churchdesk/headroom](https://github.com/aha-churchdesk/headroom) is a Rust menu-bar app
+  with a memory-aware queue for agent commands. It is more polished than maitred's queue, and its
+  guard acts only on the jobs it queued.
+- [Kevin-Liu-01/headroom](https://github.com/Kevin-Liu-01/headroom) monitors which agent session
+  owns the memory and alerts you. It doesn't enforce anything.
+
+What maitred adds is enforcement over everything agents start, queued or not: a runaway limit, a
+total budget for agent work, and a one-step return under that budget. It is also one stdlib
+Python file that you can read in ten minutes.
 
 ## Tests
 
 ```
-python3 -m unittest -v tests/test_headroom.py
+python3 -m unittest -v tests/test_maitred.py
 ```
 
-They run real processes that allocate real memory against a real guard, scoped to the test's own
-process tree so nothing else on the machine is touched.
+The tests run real processes that allocate real memory, against a real guard. Each test is scoped
+to its own process tree, so nothing else on the machine is touched.
 
 MIT licensed.

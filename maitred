@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""headroom — keep a Mac usable while AI agents run heavy work on it.
+"""maitred — keep a Mac usable while AI agents run heavy work on it.
 
 Two layers, both stdlib-only, both optional of each other:
 
-  headroom run -- <cmd>    Admission queue. A heavy command waits (FIFO) until the machine has
+  maitred run -- <cmd>    Admission queue. A heavy command waits (FIFO) until the machine has
                            the CPU and memory it will need, then runs at nice +10. Its memory
                            need is learned from its own past runs.
-  headroom daemon          Guard (a LaunchAgent). Once a second it reads the kernel's memory
+  maitred daemon          Guard (a LaunchAgent). Once a second it reads the kernel's memory
                            level and every agent-spawned process's footprint, and:
                              * kills a queued job whose process tree exceeds its cap;
                              * kills any process an agent app spawned that grew past the
@@ -15,9 +15,11 @@ Two layers, both stdlib-only, both optional of each other:
                                when memory comes back, and as a last resort kills the largest.
                            Agent apps themselves (Claude, Cursor, Codex …) are never touched.
 
-  headroom status          What is running, paused, queued, and what the guard did recently.
-  headroom install         Install the guard as a LaunchAgent (and the CLI into ~/.local/bin).
-  headroom uninstall       Remove the LaunchAgent.
+  maitred status          What is running, paused, queued, and what the guard did recently.
+  maitred install [--claude-code]
+                           Install the guard as a LaunchAgent and the CLI into ~/.local/bin;
+                           --claude-code also routes Claude Code's heavy commands through the queue.
+  maitred uninstall       Remove the LaunchAgent.
 
 Memory is measured as the kernel measures it: phys_footprint per process (the number Activity
 Monitor and the "out of application memory" dialog show) and kern.memorystatus_level (the
@@ -38,9 +40,9 @@ import time
 VERSION = "0.1.0"
 GiB = 1024 ** 3
 
-HOME = os.path.expanduser(os.environ.get("HEADROOM_HOME", "~/.local/state/headroom"))
-CONFIG_PATH = os.path.expanduser(os.environ.get("HEADROOM_CONFIG", "~/.config/headroom/config.json"))
-LABEL = "dev.headroom.guard"
+HOME = os.path.expanduser(os.environ.get("MAITRED_HOME", "~/.local/state/maitred"))
+CONFIG_PATH = os.path.expanduser(os.environ.get("MAITRED_CONFIG", "~/.config/maitred/config.json"))
+LABEL = "dev.maitred.guard"
 PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
 
 # Processes whose descendants are "agent work". The apps themselves are never killed or paused.
@@ -51,15 +53,16 @@ DEFAULT_HOSTS = [
 ]
 
 DEFAULTS = {
-    # Everything the agent apps and their children use together (the number macOS shows as
-    # "Claude is using 60 GB") may not exceed this. Over it: queue, then pause, then kill.
-    "agent_budget_pct": 55,
+    # Everything the agent apps started (tests, builds, browsers, servers — not the apps
+    # themselves, which cannot be paused) may use this much together. Over it: queue new work,
+    # pause the newest job, and past 115 % stop the largest tasks.
+    "agent_budget_pct": 40,
     # Kernel memory level (kern.memorystatus_level, % free). Admission keeps admit_floor free;
     # the guard pauses the newest job below soft, resumes above resume, kills below hard.
-    "admit_floor_pct": 25,
-    "soft_pct": 20,
-    "resume_pct": 35,
-    "hard_pct": 10,
+    "admit_floor_pct": 20,
+    "soft_pct": 15,
+    "resume_pct": 25,
+    "hard_pct": 8,
     # One job's whole process tree may not exceed this.
     "job_cap_pct": 30,
     # Any single process an agent spawned may not exceed this, queued or not.
@@ -91,7 +94,7 @@ def load_config():
     except (OSError, ValueError):
         pass
     for key, val in DEFAULTS.items():
-        env = os.environ.get("HEADROOM_" + key.upper())
+        env = os.environ.get("MAITRED_" + key.upper())
         if env is not None and not isinstance(val, list):
             cfg[key] = type(val)(env) if not isinstance(val, bool) else env not in ("0", "false")
     return cfg
@@ -194,9 +197,9 @@ def memory():
     """Two views of free memory, as % of RAM.
 
     level:  kern.memorystatus_level — the kernel's own figure; counts reclaimable file cache as
-            free. Used for pause/kill, because acting on a pessimistic number kills work for nothing.
-    strict: RAM minus wired, anonymous and compressor pages — what is left if no app memory can
-            be compressed away. Used for admission, because starting work late is cheap.
+            free, but is refreshed lazily (measured: unchanged for 10 s while a process took 4 GB).
+    strict: RAM minus wired, resident anonymous and compressor pages, from vm_stat, live.
+    free:   the smaller of the two — what every decision uses.
     """
     level = sysctl_int("kern.memorystatus_level")
     pressure = sysctl_int("kern.memorystatus_vm_pressure_level") or 1
@@ -206,20 +209,22 @@ def memory():
     strict = max(0.0, 100.0 * (TOTAL - used) / TOTAL)
     if level is None:
         level = strict
-    if os.environ.get("HEADROOM_FAKE_LEVEL"):
-        level = strict = float(os.environ["HEADROOM_FAKE_LEVEL"])
-    return {"level": float(level), "strict": strict, "pressure": pressure}
+    if os.environ.get("MAITRED_FAKE_LEVEL"):
+        level = strict = float(os.environ["MAITRED_FAKE_LEVEL"])
+    return {"level": float(level), "strict": strict, "free": min(float(level), strict),
+            "pressure": pressure}
 
 
 def process_table():
-    """pid -> (ppid, uid, command path)."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,comm="], capture_output=True,
+    """pid -> (ppid, uid, command path). Zombies are left out: an exited child its parent has
+    not reaped still reports its last footprint, and counting it makes the guard chase the dead."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,stat=,comm="], capture_output=True,
                          text=True).stdout
     table = {}
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) == 4:
-            table[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+        parts = line.split(None, 4)
+        if len(parts) == 5 and not parts[3].startswith("Z"):
+            table[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[4])
     return table
 
 
@@ -260,7 +265,7 @@ def signal_all(pids, sig):
 def notify(cfg, text):
     if not cfg.get("notify"):
         return
-    script = f'display notification {json.dumps(text)} with title "headroom"'
+    script = f'display notification {json.dumps(text)} with title "maitred"'
     subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 
@@ -372,20 +377,21 @@ def fits(req_mem, req_cpu, cfg, running):
     mem = memory()
     table = process_table()
     kids = children_map(table)
-    _, agent_total = agent_view(cfg, table, kids)
+    sizes, _ = agent_view(cfg, table, kids)
+    agent_total = sum(sizes.values())
     budget = cfg["agent_budget_pct"] / 100 * TOTAL
     # Memory a running job has reserved but not yet touched is already spoken for.
     outstanding = sum(max(0, j["mem"] - tree_footprint(j["child"], kids)) for j in running)
     if running and agent_total + outstanding + req_mem > budget:
-        return False, (f"memory: agents use {fmt_gb(agent_total)} (+{fmt_gb(outstanding)} reserved),"
+        return False, (f"memory: agent work uses {fmt_gb(agent_total)} (+{fmt_gb(outstanding)} reserved),"
                        f" budget {fmt_gb(budget)}, this needs {fmt_gb(req_mem)}")
     if not running and agent_total > budget:
-        return False, f"memory: agents already use {fmt_gb(agent_total)}, budget {fmt_gb(budget)}"
-    free_pct = mem["level"] - 100.0 * (outstanding + req_mem) / TOTAL
+        return False, f"memory: agent work already uses {fmt_gb(agent_total)}, budget {fmt_gb(budget)}"
+    free_pct = mem["free"] - 100.0 * (outstanding + req_mem) / TOTAL
     if running and free_pct < cfg["admit_floor_pct"]:
-        return False, f"memory: the Mac has {mem['level']:.0f}% free, need {fmt_gb(req_mem)}"
-    if not running and mem["level"] < cfg["soft_pct"]:
-        return False, f"memory: the Mac has only {mem['level']:.0f}% free"
+        return False, f"memory: the Mac has {mem['free']:.0f}% free, need {fmt_gb(req_mem)}"
+    if not running and mem["free"] < cfg["soft_pct"]:
+        return False, f"memory: the Mac has only {mem['free']:.0f}% free"
     return True, ""
 
 
@@ -407,9 +413,9 @@ def cmd_run(argv):
     if argv and argv[0] == "--":
         argv.pop(0)
     if not argv:
-        sys.stderr.write("usage: headroom run [--mem 4G] [--cpu 8] [--name X] -- <command…>\n")
+        sys.stderr.write("usage: maitred run [--mem 4G] [--cpu 8] [--name X] -- <command…>\n")
         return 2
-    if os.environ.get("HEADROOM_JOB"):  # nested: the outer job already holds the reservation
+    if os.environ.get("MAITRED_JOB"):  # nested: the outer job already holds the reservation
         return subprocess.call(argv)
 
     sig = name or signature(argv)
@@ -439,8 +445,8 @@ def cmd_run(argv):
                     reason = f"{ahead} job(s) ahead in the queue"
             now = time.time()
             if now - said >= 30:
-                sys.stderr.write(f"[headroom] waiting {int(now - started)}s — {reason}"
-                                 " (`headroom status`)\n")
+                sys.stderr.write(f"[maitred] waiting {int(now - started)}s — {reason}"
+                                 " (`maitred status`)\n")
                 sys.stderr.flush()
                 said = now
             time.sleep(1)
@@ -448,10 +454,10 @@ def cmd_run(argv):
         os.unlink(ticket)
         return 130
     if said:
-        sys.stderr.write(f"[headroom] started after {int(time.time() - started)}s\n")
+        sys.stderr.write(f"[maitred] started after {int(time.time() - started)}s\n")
 
     nice = cfg["nice"]
-    env = dict(os.environ, HEADROOM_JOB=str(os.getpid()))
+    env = dict(os.environ, MAITRED_JOB=str(os.getpid()))
     child = subprocess.Popen(argv, env=env, preexec_fn=lambda: os.nice(nice))
     job = {"pid": os.getpid(), "child": child.pid, "mem": req_mem, "cpu": req_cpu, "sig": sig,
            "label": label, "started": time.time(), "state": "running"}
@@ -474,7 +480,7 @@ def cmd_run(argv):
         if cur != state:
             msg = {"paused": "paused: the Mac is low on memory; will resume automatically",
                    "running": "resumed"}.get(cur, cur)
-            sys.stderr.write(f"[headroom] {msg}\n")
+            sys.stderr.write(f"[maitred] {msg}\n")
             sys.stderr.flush()
             state = cur
         try:
@@ -489,7 +495,7 @@ def cmd_run(argv):
     killed = read_json(path("killed", f"{os.getpid()}.json"))
     if killed:
         os.unlink(path("killed", f"{os.getpid()}.json"))
-        sys.stderr.write(f"[headroom] killed by the memory guard: {killed['why']}\n")
+        sys.stderr.write(f"[maitred] killed by the memory guard: {killed['why']}\n")
         return 137
     if code == 0 and peak:
         remember_peak(sig, peak)
@@ -512,15 +518,22 @@ class Guard:
             notify(self.cfg, text)
 
     def kill_tree(self, pids, why, job=None):
-        if job:
-            write_json(path("killed", f"{job['pid']}.json"), {"why": why})
-        signal_all(pids, signal.SIGCONT)
-        signal_all(pids, signal.SIGTERM)
-        deadline = time.time() + 3
-        while time.time() < deadline and any(alive(p) for p in pids):
-            time.sleep(0.2)
-        signal_all([p for p in pids if alive(p)], signal.SIGKILL)
-        log_event("kill", why=why, pids=pids[:20], job=job and job["label"])
+        self.kill_many([(pids, why, job)])
+
+    def kill_many(self, victims):
+        """victims: [(pids, why, job)]. All are signalled at once; stragglers get SIGKILL after 1s."""
+        every = []
+        for pids, why, job in victims:
+            if job:
+                write_json(path("killed", f"{job['pid']}.json"), {"why": why})
+            signal_all(pids, signal.SIGCONT)
+            signal_all(pids, signal.SIGTERM)
+            every += pids
+            log_event("kill", why=why, pids=pids[:20], job=job and job["label"])
+        deadline = time.time() + 1
+        while time.time() < deadline and any(alive(p) for p in every):
+            time.sleep(0.1)
+        signal_all([p for p in every if alive(p)], signal.SIGKILL)
 
     def set_state(self, job, state):
         job["state"] = state
@@ -553,6 +566,7 @@ class Guard:
         # Runaway: any process an agent app spawned, inside a job or not.
         runaway = cfg["runaway_pct"] / 100 * TOTAL
         sizes, agent_total = agent_view(cfg, table, kids)
+        work = sum(sizes.values())
         budget = cfg["agent_budget_pct"] / 100 * TOTAL
         for p, fp in sizes.items():
             if fp > runaway:
@@ -565,31 +579,44 @@ class Guard:
 
         if time.time() < self.cooldown_until:
             return
-        level, pressure = mem["level"], mem["pressure"]
+        level, pressure = mem["free"], mem["pressure"]
         active = [j for j in running if j.get("state") != "paused"]
         paused = [j for j in running if j.get("state") == "paused"]
 
         kernel_hard = level < cfg["hard_pct"] or pressure >= 4
-        over_hard = kernel_hard or agent_total > budget * 1.15
-        over_soft = level < cfg["soft_pct"] or agent_total > budget
-        relaxed = level > cfg["resume_pct"] and agent_total < budget * 0.85
-        state = f"{level:.0f}% free, agents {fmt_gb(agent_total)} of {fmt_gb(budget)}"
+        over_hard = kernel_hard or work > budget * 1.15
+        over_soft = level < cfg["soft_pct"] or work > budget
+        relaxed = level > cfg["resume_pct"] and work < budget * 0.85
+        state = f"{level:.0f}% free, agent work {fmt_gb(work)} of {fmt_gb(budget)}"
         if over_hard:
-            # Over budget: only queued jobs are fair game (the budget is a policy). The whole
-            # Mac about to run out: the largest thing any agent started, queued or not.
+            # Queued jobs first, at any size. Unqueued agent processes too, once they are big
+            # enough to matter: many of them, each under the runaway limit, can still fill the
+            # Mac together, and nothing else would stop them before the kernel does.
+            floor = 1 * GiB if kernel_hard else 2 * GiB
             cands = [(j["fp"], j["tree"], j, j["label"]) for j in running]
-            if kernel_hard:
-                cands += [(fp, [p] + descendants(p, kids), None, os.path.basename(table[p][2]))
-                          for p, fp in sizes.items() if fp > 1 * GiB and p not in job_pids]
+            cands += [(fp, [p] + descendants(p, kids), None, os.path.basename(table[p][2]))
+                      for p, fp in sizes.items() if fp > floor and p not in job_pids]
             if cands:
-                fp, tree, job, what = max(cands, key=lambda c: c[0])
-                why = f"memory critical ({state}); this used {fmt_gb(fp)}"
-                self.kill_tree(tree, why, job)
-                self.say("hard", f"Memory critical — stopped the largest agent task ({fmt_gb(fp)}): {what[:60]}", 0)
+                # Kill enough, largest first, to get back under budget in one step: agents can
+                # grow by gigabytes a second, one victim per tick loses that race.
+                excess = max(work - budget * 0.95, 1)
+                cands.sort(key=lambda c: -c[0])
+                chosen, freed = [], 0
+                for c in cands:
+                    chosen.append(c)
+                    freed += c[0]
+                    if freed >= excess:
+                        break
+                cause = (f"the Mac is almost out of memory ({state})" if kernel_hard
+                         else f"agents are far over their memory budget ({state})")
+                self.kill_many([(tree, f"{cause}; this used {fmt_gb(fp)}", job)
+                                for fp, tree, job, _ in chosen])
+                names = ", ".join(f"{what[:40]} {fmt_gb(fp)}" for fp, _, _, what in chosen[:3])
+                self.say("hard", f"Memory: stopped {len(chosen)} agent task(s) — {names}", 0)
             elif kernel_hard:
                 self.say("hard-none", f"Memory critical ({state}) and nothing an "
                          "agent started is large; check Docker and open apps.", 300)
-            self.cooldown_until = time.time() + 8
+            self.cooldown_until = time.time() + 2
         elif over_soft and paused and time.time() - paused[-1].get("state_since", 0) > cfg["pause_max_s"]:
             j = paused[-1]
             why = (f"paused {int(cfg['pause_max_s'])}s and memory never came back ({state});"
@@ -628,13 +655,14 @@ def cmd_status():
     cfg = load_config()
     mem = memory()
     pressure = {1: "normal", 2: "warning", 4: "critical"}.get(mem["pressure"], mem["pressure"])
-    guard = "running" if guard_pid() else "NOT running (headroom install)"
+    guard = "running" if guard_pid() else "NOT running (maitred install)"
     print(f"memory  {mem['level']:.0f}% free (kernel)  ·  {mem['strict']:.0f}% free (strict)"
           f"  ·  pressure {pressure}  ·  RAM {fmt_gb(TOTAL)}")
     table = process_table()
-    _, agent_total = agent_view(cfg, table, children_map(table))
-    print(f"agents  {fmt_gb(agent_total)} of {fmt_gb(cfg['agent_budget_pct'] / 100 * TOTAL)} budget"
-          " (agent apps + everything they started)")
+    sizes, agent_total = agent_view(cfg, table, children_map(table))
+    work = sum(sizes.values())
+    print(f"agents  work {fmt_gb(work)} of {fmt_gb(cfg['agent_budget_pct'] / 100 * TOTAL)} budget"
+          f"  ·  apps + work {fmt_gb(agent_total)}")
     print(f"cpu     load {os.getloadavg()[0]:.1f} on {cfg['cpus']} cores")
     print(f"guard   {guard}")
     with Ledger():
@@ -668,17 +696,43 @@ def guard_pid():
     return int(m.group(1)) if m else None
 
 
-def cmd_install():
+def install_claude_code_hook(src):
+    """Add the bundled PreToolUse(Bash) hook to Claude Code's settings, once, with a backup."""
+    settings = os.path.expanduser(os.environ.get("MAITRED_CLAUDE_SETTINGS", "~/.claude/settings.json"))
+    hook = os.path.join(os.path.dirname(src), "integrations", "claude_code_hook.py")
+    command = f"python3 {shlex.quote(hook)}"
+    data = read_json(settings, {}) if os.path.exists(settings) else {}
+    if data is None:
+        print(f"claude code: {settings} is not valid JSON, left alone")
+        return
+    groups = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    if any(command == h.get("command") for g in groups for h in g.get("hooks", [])):
+        print(f"claude code: hook already in {settings}")
+        return
+    if os.path.exists(settings):
+        with open(settings) as f, open(settings + ".bak-maitred", "w") as b:
+            b.write(f.read())
+    groups.append({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]})
+    os.makedirs(os.path.dirname(settings), exist_ok=True)
+    with open(settings, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print(f"claude code: heavy commands now go through the queue ({settings})")
+
+
+def cmd_install(argv=()):
     src = os.path.realpath(__file__)
+    if "--claude-code" in argv:
+        install_claude_code_hook(src)
     bindir = os.path.expanduser("~/.local/bin")
     os.makedirs(bindir, exist_ok=True)
-    target = os.path.join(bindir, "headroom")
+    target = os.path.join(bindir, "maitred")
     if os.path.realpath(target) != src:
         if os.path.lexists(target):
             os.unlink(target)
         os.symlink(src, target)
     python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
-    logf = os.path.expanduser("~/Library/Logs/headroom.log")
+    logf = os.path.expanduser("~/Library/Logs/maitred.log")
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -725,13 +779,13 @@ def main(argv):
     if cmd == "status":
         return cmd_status()
     if cmd == "install":
-        return cmd_install()
+        return cmd_install(rest)
     if cmd == "uninstall":
         return cmd_uninstall()
     if cmd == "--version":
         print(VERSION)
         return 0
-    # `headroom <cmd…>` is shorthand for `headroom run -- <cmd…>`
+    # `maitred <cmd…>` is shorthand for `maitred run -- <cmd…>`
     return cmd_run(["--"] + argv)
 
 

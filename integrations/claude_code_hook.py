@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse(Bash) hook: send heavy commands through `headroom run`.
+"""Claude Code PreToolUse(Bash) hook: send heavy commands through `maitred run`.
 
-Agents never have to know headroom exists: a test suite, a build or a type check is rewritten
-to `headroom run --cpu N --mem XG --name … -- /bin/zsh -c '<command>'` before it runs, so it
+Agents never have to know maitred exists: a test suite, a build or a type check is rewritten
+to `maitred run --cpu N --mem XG --name … -- /bin/zsh -c '<command>'` before it runs, so it
 waits its turn instead of piling onto a full machine. Everything else passes through untouched.
 
-Install: see README ("Claude Code"). Escape hatch: put `# headroom-ok` in the command.
+Install: see README ("Claude Code"). Escape hatch: put `# maitred-ok` in the command.
 """
 import json
 import os
@@ -14,11 +14,11 @@ import shlex
 import shutil
 import sys
 
-ESCAPE = "headroom-ok"
-HEADROOM = shutil.which("headroom") or os.path.expanduser("~/.local/bin/headroom")
+ESCAPE = "maitred-ok"
+HEADROOM = shutil.which("maitred") or os.path.expanduser("~/.local/bin/maitred")
 
 _RUN = r"(?:uv\s+run\s+(?:--\S+\s+)*|poetry\s+run\s+|python3?\s+-m\s+|npx\s+(?:--\S+\s+)*|bunx\s+|pnpm\s+exec\s+)?"
-# (pattern at command position, cpu cores, memory prior in GB). headroom learns the real peak.
+# (pattern at command position, cpu cores, memory prior in GB). maitred learns the real peak.
 HEAVY = [(re.compile(p), cpu, mem) for p, cpu, mem in (
     (_RUN + r"pytest\b", 8, 3),
     (_RUN + r"(?:mypy|tsc|pyright)\b", 2, 2),
@@ -47,7 +47,7 @@ def segments(command):
 
 def match(command):
     for seg in segments(command):
-        if seg.startswith(("headroom ", HEADROOM)):
+        if seg.startswith(("maitred ", HEADROOM)):
             return None
         for pat, cpu, mem in HEAVY:
             if pat.match(seg):
