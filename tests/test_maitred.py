@@ -39,11 +39,6 @@ class Base(unittest.TestCase):
         self.config(scope_pid=os.getpid(), notify=False, tick_s=0.5)
         self.daemon = None
 
-    def tearDown(self):
-        if self.daemon:
-            self.daemon.kill()
-            self.daemon.wait()
-
     def config(self, **kw):
         cur = {}
         if os.path.exists(self.cfg_path):
@@ -52,6 +47,11 @@ class Base(unittest.TestCase):
         cur.update(kw)
         with open(self.cfg_path, "w") as f:
             json.dump(cur, f)
+
+    def tearDown(self):
+        if self.daemon:
+            self.daemon.kill()
+            self.daemon.communicate()
 
     def run_bg(self, *args, extra_env=None):
         env = dict(self.env, **(extra_env or {}))
@@ -75,7 +75,7 @@ class Queue(Base):
         a = self.run_bg("run", "--", "sleep", "2")
         time.sleep(0.3)
         b = self.run_bg("run", "--", "sleep", "2")
-        a.wait(), b.wait()
+        a.communicate(), b.communicate()
         self.assertGreaterEqual(time.time() - t0, 3.8, "second job must wait for the first")
 
     def test_small_jobs_share_cores(self):
@@ -83,7 +83,7 @@ class Queue(Base):
         t0 = time.time()
         a = self.run_bg("run", "--", "sleep", "2")
         b = self.run_bg("run", "--", "sleep", "2")
-        a.wait(), b.wait()
+        a.communicate(), b.communicate()
         self.assertLess(time.time() - t0, 3.5, "two 2-core jobs fit on 4 cores at once")
 
     def test_memory_reservation_queues_second_job(self):
@@ -95,18 +95,19 @@ class Queue(Base):
         a = self.run_bg("run", "--mem", "3G", "--", "sleep", "2")
         time.sleep(0.3)
         b = self.run_bg("run", "--mem", "3G", "--", "sleep", "2")
-        a.wait(), b.wait()
+        a.communicate(), b.communicate()
         self.assertGreaterEqual(time.time() - t0, 3.8, "3G + 3G does not fit a 4G maitred")
 
     def test_exit_code_passes_through(self):
         p = self.run_bg("run", "--", "sh", "-c", "exit 7")
-        p.wait()
+        p.communicate()
         self.assertEqual(p.returncode, 7)
 
     def test_learns_peak_memory(self):
         p = self.run_bg("run", "--name", "hog", "--", sys.executable, "-c", HOG, "1", "1.5")
-        p.wait()
-        hist = json.load(open(os.path.join(self.env["MAITRED_HOME"], "history.json")))
+        p.communicate()
+        with open(os.path.join(self.env["MAITRED_HOME"], "history.json")) as f:
+            hist = json.load(f)
         self.assertGreater(hist["hog"][-1], 0.9 * GiB)
 
 
@@ -141,7 +142,8 @@ class Guard(Base):
         jobs_dir = os.path.join(self.env["MAITRED_HOME"], "jobs")
         while time.time() < deadline and not paused:
             for name in os.listdir(jobs_dir) if os.path.isdir(jobs_dir) else []:
-                j = json.load(open(os.path.join(jobs_dir, name)))
+                with open(os.path.join(jobs_dir, name)) as f:
+                    j = json.load(f)
                 paused = paused or j.get("state") == "paused"
             time.sleep(0.3)
         self.assertTrue(paused, "the job should be paused once agents exceed the budget")

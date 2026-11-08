@@ -16,7 +16,17 @@ git clone https://github.com/Coiggahou2002/maitred ~/maitred
 ~/maitred/maitred install --claude-code
 ```
 
-That's the whole setup. macOS 12+, the system `python3`, no dependencies.
+That's the whole setup. macOS 12+, any `python3` ≥ 3.9 (the one Xcode's command line tools
+ship is enough), no dependencies. What `install` does, so nothing is a surprise:
+
+- links `~/.local/bin/maitred` to the clone — put `~/.local/bin` on your `PATH` if it isn't (install tells you);
+- loads the guard as `~/Library/LaunchAgents/dev.maitred.guard.plist` (starts at login, restarted if it dies);
+- with `--claude-code`, adds one `PreToolUse` hook to `~/.claude/settings.json` (backup next to it as
+  `settings.json.bak-maitred`; `MAITRED_CLAUDE_SETTINGS=<path>` writes elsewhere). New Claude Code
+  sessions pick it up; running ones need a restart.
+
+All three point at the clone, so keep it where it is — after moving it, run `install` again.
+`maitred uninstall` removes the guard, the link and the hook; it leaves your settings and history.
 
 ## What it does
 
@@ -29,8 +39,18 @@ room for it. Jobs go in first-come, first-served order.
   reservation to match. You never have to estimate anything.
 - **Priority.** Jobs run at `nice +10`, so whatever you are clicking on stays fast.
 - **Hands-free with Claude Code.** With `--claude-code`, every heavy shell command an agent runs
-  goes through the queue automatically: pytest, npm/pnpm/yarn test and build, vitest, jest,
-  playwright, tsc, mypy, docker build, xcodebuild, swift, cargo, go, make, gradle.
+  goes through the queue automatically, with a starting reservation per kind of command (raised
+  later to what it really used):
+
+  | command | cores | memory prior |
+  |---|---|---|
+  | pytest, cargo, go, make, gradle, mvn, xcodebuild, swift | 8 | 3–6 GB |
+  | npm / pnpm / yarn / bun `test`, `e2e` | 4 | 6 GB |
+  | npm … `build`, vitest, jest, playwright test | 4 | 3–4 GB |
+  | tsc, mypy, pyright | 2 | 2 GB |
+  | docker build | 4 | 2 GB (the build itself runs in Docker's VM) |
+
+  Everything else runs untouched. Put `# maitred-ok` in a command to skip the queue.
 
 **2. A memory guard.** A LaunchAgent checks once a second. It measures memory the way macOS does:
 `phys_footprint` per process (the figure Activity Monitor and the out-of-memory dialog show), and
@@ -73,11 +93,16 @@ A single 12 GB process started outside the queue was killed 1 s after it crossed
 ## Commands
 
 ```
-maitred run [--mem 4G] [--cpu 8] [--name X] -- <cmd…>   queue a command (or: maitred <cmd…>)
+maitred run [--mem 4G] [--cpu 8] [--name X] -- <cmd…>   queue a command
 maitred status                                          memory, budget, jobs, recent actions
 maitred install [--claude-code]                         CLI + guard (+ Claude Code hook)
 maitred uninstall                                       remove the guard
 ```
+
+`--name` is the key maitred learns memory under; by default it is the command's first words plus
+the directory, so `pytest tests/unit` and `pytest tests/` are learned separately. `maitred <cmd…>`
+is shorthand for `maitred run -- <cmd…>` (except for the words `run`, `status`, `install`,
+`uninstall`).
 
 To check that the guard is alive, look for `guard running` in `maitred status`, or run
 `launchctl list dev.maitred.guard`. Its log is `~/.local/state/maitred/events.log`.
@@ -133,7 +158,8 @@ Python file that you can read in ten minutes.
 ## Tests
 
 ```
-python3 -m unittest -v tests/test_maitred.py
+python3 -m unittest -v tests/test_maitred.py   # from the repo root, ~1 minute, allocates up to ~4 GB
+python3 tests/storm.py                         # optional load test against the installed guard, ~2 minutes, ~44 GB of demand
 ```
 
 The tests run real processes that allocate real memory, against a real guard. Each test is scoped

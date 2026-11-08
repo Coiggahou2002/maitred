@@ -686,7 +686,7 @@ def cmd_status():
         print("recent")
         for e in recent:
             stamp = time.strftime("%m-%d %H:%M", time.localtime(e["t"]))
-            print(f"  {stamp} {e['kind']:<6} {(e.get('why') or e.get('job') or '')[:90]}")
+            print(f"  {stamp} {e['kind']:<6} {(e.get('why') or e.get('job') or '')[:200]}")
     return 0
 
 
@@ -755,8 +755,30 @@ def cmd_install(argv=()):
     subprocess.run(["launchctl", "bootstrap", domain, PLIST], check=True)
     time.sleep(1.5)
     print(f"installed: {target} -> {src}")
-    print(f"guard:     {PLIST} (pid {guard_pid()})")
+    print(f"guard:     {PLIST} (pid {guard_pid()}), starts at login")
+    print(f"note:      both point at this checkout; moving or deleting {os.path.dirname(src)}"
+          " breaks them (run install again from the new place)")
+    if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"note:      {bindir} is not on your PATH; add it, e.g.\n"
+              f"           echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc")
     return 0
+
+
+def remove_claude_code_hook():
+    settings = os.path.expanduser(os.environ.get("MAITRED_CLAUDE_SETTINGS", "~/.claude/settings.json"))
+    data = read_json(settings)
+    if not data:
+        return
+    groups = (data.get("hooks") or {}).get("PreToolUse") or []
+    kept = [g for g in groups
+            if not any("claude_code_hook.py" in h.get("command", "") and "maitred" in h.get("command", "")
+                       for h in g.get("hooks", []))]
+    if len(kept) != len(groups):
+        data["hooks"]["PreToolUse"] = kept
+        with open(settings, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        print(f"claude code: hook removed from {settings}")
 
 
 def cmd_uninstall():
@@ -764,6 +786,12 @@ def cmd_uninstall():
     if os.path.exists(PLIST):
         os.unlink(PLIST)
     print("guard removed")
+    remove_claude_code_hook()
+    link = os.path.expanduser("~/.local/bin/maitred")
+    if os.path.islink(link):
+        os.unlink(link)
+        print(f"removed {link}")
+    print(f"left in place: your checkout, settings in {os.path.dirname(CONFIG_PATH)}, history in {HOME}")
     return 0
 
 
