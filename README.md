@@ -95,6 +95,7 @@ A single 12 GB process started outside the queue was killed 1 s after it crossed
 ```
 maitred run [--mem 4G] [--cpu 8] [--name X] -- <cmd…>   queue a command
 maitred status                                          memory, budget, jobs, recent actions
+maitred report [--days 7]                               did it work? guard actions per day, and how often macOS ran out of memory or was force-restarted
 maitred install [--claude-code]                         CLI + guard (+ Claude Code hook)
 maitred uninstall                                       remove the guard
 ```

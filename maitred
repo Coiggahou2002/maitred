@@ -16,6 +16,8 @@ Two layers, both stdlib-only, both optional of each other:
                            Agent apps themselves (Claude, Cursor, Codex …) are never touched.
 
   maitred status          What is running, paused, queued, and what the guard did recently.
+  maitred report [--days 7]
+                           Guard actions per day, plus macOS's own out-of-memory and forced-restart records.
   maitred install [--claude-code]
                            Install the guard as a LaunchAgent and the CLI into ~/.local/bin;
                            --claude-code also routes Claude Code's heavy commands through the queue.
@@ -690,6 +692,50 @@ def cmd_status():
     return 0
 
 
+def cmd_report(argv):
+    """What happened over the last N days: the guard's actions, and macOS's own record of
+    running out of memory (JetsamEvent) and of forced restarts (ResetCounter)."""
+    days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7
+    since = time.time() - days * 86400
+    try:
+        with open(path("events.log")) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        events = []
+    events = [e for e in events if e.get("t", 0) >= since]
+    counts = {}
+    for e in events:
+        if e["kind"] in ("kill", "pause", "resume"):
+            day = time.strftime("%m-%d", time.localtime(e["t"]))
+            counts.setdefault(day, {"kill": 0, "pause": 0, "resume": 0})[e["kind"]] += 1
+    system = {}
+    report_dir = "/Library/Logs/DiagnosticReports"
+    try:
+        names = os.listdir(report_dir)
+    except OSError:
+        names = []
+    for name in names:
+        kind = ("out of memory" if name.startswith("JetsamEvent") else
+                "forced restart" if name.startswith("ResetCounter") else None)
+        if not kind:
+            continue
+        mtime = os.path.getmtime(os.path.join(report_dir, name))
+        if mtime >= since:
+            system.setdefault(kind, []).append(time.strftime("%m-%d %H:%M", time.localtime(mtime)))
+    print(f"last {days} days")
+    print("guard   " + ("  ".join(f"{d}: {c['kill']} killed, {c['pause']} paused"
+                                    for d, c in sorted(counts.items())) or "no actions"))
+    for kind in ("out of memory", "forced restart"):
+        stamps = sorted(system.get(kind, []))
+        print(f"macOS   {kind}: {len(stamps)}" + (f"  ({', '.join(stamps)})" if stamps else ""))
+    kills = [e for e in events if e["kind"] == "kill"][-10:]
+    if kills:
+        print("kills")
+        for e in kills:
+            print(f"  {time.strftime('%m-%d %H:%M', time.localtime(e['t']))}  {e.get('why', '')[:160]}")
+    return 0
+
+
 def guard_pid():
     out = subprocess.run(["launchctl", "list", LABEL], capture_output=True, text=True).stdout
     m = re.search(r'"PID" = (\d+);', out)
@@ -806,6 +852,8 @@ def main(argv):
         Guard().loop()
     if cmd == "status":
         return cmd_status()
+    if cmd == "report":
+        return cmd_report(rest)
     if cmd == "install":
         return cmd_install(rest)
     if cmd == "uninstall":
