@@ -616,8 +616,10 @@ class Guard:
                 names = ", ".join(f"{what[:40]} {fmt_gb(fp)}" for fp, _, _, what in chosen[:3])
                 self.say("hard", f"Memory: stopped {len(chosen)} agent task(s) — {names}", 0)
             elif kernel_hard:
-                self.say("hard-none", f"Memory critical ({state}) and nothing an "
-                         "agent started is large; check Docker and open apps.", 300)
+                top = max(((footprint(p), p) for p in table if p not in sizes), default=(0, 0))
+                biggest = f"; biggest is {friendly(table[top[1]][2])} at {fmt_gb(top[0])}" if top[1] else ""
+                self.say("hard-none", f"Memory critical ({state}) and nothing an agent started is "
+                         f"large{biggest}.", 300)
             self.cooldown_until = time.time() + 2
         elif over_soft and paused and time.time() - paused[-1].get("state_since", 0) > cfg["pause_max_s"]:
             j = paused[-1]
@@ -653,6 +655,13 @@ class Guard:
 # ---------------------------------------------------------------- status / install
 
 
+def friendly(command):
+    if "com.apple.Virtualization.VirtualMachine" in command:
+        return "Docker/VM"
+    m = re.search(r"/([^/]+)\.app/", command)
+    return m.group(1) if m else os.path.basename(command)
+
+
 def cmd_status():
     cfg = load_config()
     mem = memory()
@@ -667,6 +676,12 @@ def cmd_status():
           f"  ·  apps + work {fmt_gb(agent_total)}")
     print(f"cpu     load {os.getloadavg()[0]:.1f} on {cfg['cpus']} cores")
     print(f"guard   {guard}")
+    hosts = [re.compile(h) for h in cfg["hosts"]]
+    others = sorted(((footprint(p), p) for p in table
+                     if p not in sizes and table[p][1] == os.getuid()
+                     and not any(h.search(table[p][2]) for h in hosts)), reverse=True)[:3]
+    print("others  " + "  ·  ".join(f"{friendly(table[p][2])} {fmt_gb(fp)}" for fp, p in others)
+          + "  (not agent work; left alone)")
     with Ledger():
         running, queue = jobs(), tickets()
     kids = children_map(process_table())
