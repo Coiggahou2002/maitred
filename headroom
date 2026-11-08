@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""headroom — keep a Mac usable while AI agents run heavy work on it.
+
+Two layers, both stdlib-only, both optional of each other:
+
+  headroom run -- <cmd>    Admission queue. A heavy command waits (FIFO) until the machine has
+                           the CPU and memory it will need, then runs at nice +10. Its memory
+                           need is learned from its own past runs.
+  headroom daemon          Guard (a LaunchAgent). Once a second it reads the kernel's memory
+                           level and every agent-spawned process's footprint, and:
+                             * kills a queued job whose process tree exceeds its cap;
+                             * kills any process an agent app spawned that grew past the
+                               runaway limit (a test runner at 246 GB, a headless Chrome at 13 GB);
+                             * under memory pressure pauses the newest job (SIGSTOP), resumes it
+                               when memory comes back, and as a last resort kills the largest.
+                           Agent apps themselves (Claude, Cursor, Codex …) are never touched.
+
+  headroom status          What is running, paused, queued, and what the guard did recently.
+  headroom install         Install the guard as a LaunchAgent (and the CLI into ~/.local/bin).
+  headroom uninstall       Remove the LaunchAgent.
+
+Memory is measured as the kernel measures it: phys_footprint per process (the number Activity
+Monitor and the "out of application memory" dialog show) and kern.memorystatus_level (the
+percentage the kernel's own jetsam works from).
+"""
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+GiB = 1024 ** 3
+
+HOME = os.path.expanduser(os.environ.get("HEADROOM_HOME", "~/.local/state/headroom"))
+CONFIG_PATH = os.path.expanduser(os.environ.get("HEADROOM_CONFIG", "~/.config/headroom/config.json"))
+LABEL = "dev.headroom.guard"
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+
+# Processes whose descendants are "agent work". The apps themselves are never killed or paused.
+DEFAULT_HOSTS = [
+    r"/Claude\.app/", r"/claude-code/", r"/\.local/bin/claude$", r"/bin/claude$",
+    r"/Cursor\.app/", r"/Codex\.app/", r"/bin/codex$", r"/Paseo\.app/", r"Paseo Daemon$",
+    r"/Windsurf\.app/", r"/bin/opencode$", r"/bin/gemini$", r"/bin/aider$",
+]
+
+DEFAULTS = {
+    # Everything the agent apps and their children use together (the number macOS shows as
+    # "Claude is using 60 GB") may not exceed this. Over it: queue, then pause, then kill.
+    "agent_budget_pct": 55,
+    # Kernel memory level (kern.memorystatus_level, % free). Admission keeps admit_floor free;
+    # the guard pauses the newest job below soft, resumes above resume, kills below hard.
+    "admit_floor_pct": 25,
+    "soft_pct": 20,
+    "resume_pct": 35,
+    "hard_pct": 10,
+    # One job's whole process tree may not exceed this.
+    "job_cap_pct": 30,
+    # Any single process an agent spawned may not exceed this, queued or not.
+    "runaway_pct": 22,
+    # CPU tokens = cores. A job asks for cpu tokens; default half the machine.
+    "cpus": os.cpu_count() or 8,
+    "default_cpu": max(1, (os.cpu_count() or 8) // 2),
+    "default_mem_gb": 2,
+    "nice": 10,
+    # A job paused this long while memory stays short is killed, so it stops holding memory.
+    "pause_max_s": 180,
+    "load_factor": 1.5,
+    "tick_s": 1.0,
+    "hosts": DEFAULT_HOSTS,
+    "notify": True,
+    # Testing aid: treat only this pid's descendants as agent work (0 = use "hosts").
+    "scope_pid": 0,
+}
+
+
+# ---------------------------------------------------------------- config & state
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    for key, val in DEFAULTS.items():
+        env = os.environ.get("HEADROOM_" + key.upper())
+        if env is not None and not isinstance(val, list):
+            cfg[key] = type(val)(env) if not isinstance(val, bool) else env not in ("0", "false")
+    return cfg
+
+
+def path(*parts):
+    p = os.path.join(HOME, *parts)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    return p
+
+
+def read_json(p, default=None):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, data):
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, p)
+
+
+class Ledger:
+    """One machine-wide critical section for queue + job registry."""
+
+    def __enter__(self):
+        self.fd = os.open(path("lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def log_event(kind, **fields):
+    fields.update(t=time.time(), kind=kind)
+    with open(path("events.log"), "a") as f:
+        f.write(json.dumps(fields) + "\n")
+
+
+def fmt_gb(n):
+    return f"{n / GiB:.1f}G"
+
+
+def parse_size(s):
+    m = re.fullmatch(r"\s*([\d.]+)\s*([kmgt]?)i?b?\s*", str(s), re.I)
+    if not m:
+        raise ValueError(f"bad size: {s}")
+    mult = {"": GiB, "k": 1024, "m": 1024 ** 2, "g": GiB, "t": 1024 ** 4}[m.group(2).lower()]
+    return int(float(m.group(1)) * mult)
+
+
+# ---------------------------------------------------------------- kernel readings
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+
+
+class _RusageV0(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (n, ctypes.c_uint64) for n in (
+            "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups", "pageins",
+            "wired_size", "resident_size", "phys_footprint", "proc_start_abstime",
+            "proc_exit_abstime")
+    ]
+
+
+def footprint(pid):
+    """phys_footprint in bytes, 0 if the process is gone or not ours."""
+    ri = _RusageV0()
+    if _libproc.proc_pid_rusage(int(pid), 0, ctypes.byref(ri)) != 0:
+        return 0
+    return ri.phys_footprint
+
+
+def sysctl_int(name):
+    val = ctypes.c_int64(0)
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    if _libc.sysctlbyname(name.encode(), ctypes.byref(val), ctypes.byref(size), None, 0) != 0:
+        return None
+    return val.value if size.value == 8 else ctypes.c_int32(val.value & 0xFFFFFFFF).value
+
+
+TOTAL = sysctl_int("hw.memsize") or 16 * GiB
+
+
+def vm_pages():
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    vals = {k.strip().lower(): int(v) for k, v in re.findall(r"^([^:\n]+):\s+(\d+)\.", out, re.M)}
+    return page, vals
+
+
+def memory():
+    """Two views of free memory, as % of RAM.
+
+    level:  kern.memorystatus_level — the kernel's own figure; counts reclaimable file cache as
+            free. Used for pause/kill, because acting on a pessimistic number kills work for nothing.
+    strict: RAM minus wired, anonymous and compressor pages — what is left if no app memory can
+            be compressed away. Used for admission, because starting work late is cheap.
+    """
+    level = sysctl_int("kern.memorystatus_level")
+    pressure = sysctl_int("kern.memorystatus_vm_pressure_level") or 1
+    page, v = vm_pages()
+    used = (v.get("pages wired down", 0) + v.get("anonymous pages", 0)
+            + v.get("pages occupied by compressor", 0)) * page
+    strict = max(0.0, 100.0 * (TOTAL - used) / TOTAL)
+    if level is None:
+        level = strict
+    if os.environ.get("HEADROOM_FAKE_LEVEL"):
+        level = strict = float(os.environ["HEADROOM_FAKE_LEVEL"])
+    return {"level": float(level), "strict": strict, "pressure": pressure}
+
+
+def process_table():
+    """pid -> (ppid, uid, command path)."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,comm="], capture_output=True,
+                         text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            table[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+    return table
+
+
+def children_map(table):
+    kids = {}
+    for pid, (ppid, _, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    return kids
+
+
+def descendants(root, kids):
+    out, stack = [], list(kids.get(root, []))
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def signal_all(pids, sig):
+    for p in pids:
+        try:
+            os.kill(p, sig)
+        except OSError:
+            pass
+
+
+def notify(cfg, text):
+    if not cfg.get("notify"):
+        return
+    script = f'display notification {json.dumps(text)} with title "headroom"'
+    subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- jobs & queue
+
+
+def jobs():
+    d = path("jobs", "x")
+    d = os.path.dirname(d)
+    out = []
+    for name in os.listdir(d):
+        if not name.endswith(".json"):
+            continue
+        j = read_json(os.path.join(d, name))
+        if not j:
+            continue
+        if not alive(j["pid"]):
+            os.unlink(os.path.join(d, name))
+            continue
+        out.append(j)
+    return sorted(out, key=lambda j: j["started"])
+
+
+def job_path(pid):
+    return path("jobs", f"{pid}.json")
+
+
+def tickets():
+    d = os.path.dirname(path("queue", "x"))
+    out = []
+    for name in sorted(os.listdir(d)):
+        t = read_json(os.path.join(d, name))
+        if not t or not alive(t["pid"]):
+            try:
+                os.unlink(os.path.join(d, name))
+            except OSError:
+                pass
+            continue
+        t["file"] = os.path.join(d, name)
+        out.append(t)
+    return out
+
+
+def signature(argv):
+    """Stable name for 'the same kind of command', used to learn its memory need."""
+    words = []
+    for w in argv:
+        if w.startswith("-") or ("=" in w and not words):
+            continue
+        words.append(os.path.basename(w) if "/" in w else w)
+        if len(words) == 3:
+            break
+    repo = os.path.basename(os.getcwd())
+    return " ".join(words) + " @" + repo
+
+
+def learned_mem(sig):
+    peaks = (read_json(path("history.json"), {}) or {}).get(sig, [])
+    return int(max(peaks[-5:]) * 1.15) if peaks else None
+
+
+def remember_peak(sig, peak):
+    with Ledger():
+        hist = read_json(path("history.json"), {}) or {}
+        hist[sig] = (hist.get(sig, []) + [int(peak)])[-10:]
+        write_json(path("history.json"), hist)
+
+
+def tree_footprint(root, kids):
+    return sum(footprint(p) for p in [root] + descendants(root, kids))
+
+
+def agent_view(cfg, table, kids):
+    """(sizes, total): footprint of each non-app process the agent apps spawned, and the total
+    of everything under the agent apps, the apps included."""
+    hosts = [re.compile(h) for h in cfg["hosts"]]
+    uid = os.getuid()
+
+    def is_host(pid):
+        return any(h.search(table[pid][2]) for h in hosts)
+
+    roots = [p for p in table if is_host(p) and not (table[p][0] in table and is_host(table[p][0]))]
+    if cfg.get("scope_pid"):
+        scope = int(cfg["scope_pid"])
+        roots, is_host = [scope], (lambda pid: pid == scope)
+    sizes, total = {}, 0
+    for root in roots:
+        for p in [root] + descendants(root, kids):
+            if p not in table or table[p][1] != uid:
+                continue
+            fp = footprint(p)
+            total += fp
+            if not is_host(p):
+                sizes[p] = fp
+    return sizes, total
+
+
+def fits(req_mem, req_cpu, cfg, running):
+    """(ok, reason) for starting a job with this reservation right now."""
+    if any(j.get("state") == "paused" for j in running):
+        return False, "a job is paused for memory pressure"
+    cpu_used = sum(j["cpu"] for j in running)
+    if running and cpu_used + req_cpu > cfg["cpus"]:
+        return False, f"CPU: {cpu_used}/{cfg['cpus']} cores reserved"
+    load1 = os.getloadavg()[0]
+    if running and load1 > cfg["cpus"] * cfg["load_factor"]:
+        return False, f"CPU: load {load1:.1f}"
+    mem = memory()
+    table = process_table()
+    kids = children_map(table)
+    _, agent_total = agent_view(cfg, table, kids)
+    budget = cfg["agent_budget_pct"] / 100 * TOTAL
+    # Memory a running job has reserved but not yet touched is already spoken for.
+    outstanding = sum(max(0, j["mem"] - tree_footprint(j["child"], kids)) for j in running)
+    if running and agent_total + outstanding + req_mem > budget:
+        return False, (f"memory: agents use {fmt_gb(agent_total)} (+{fmt_gb(outstanding)} reserved),"
+                       f" budget {fmt_gb(budget)}, this needs {fmt_gb(req_mem)}")
+    if not running and agent_total > budget:
+        return False, f"memory: agents already use {fmt_gb(agent_total)}, budget {fmt_gb(budget)}"
+    free_pct = mem["level"] - 100.0 * (outstanding + req_mem) / TOTAL
+    if running and free_pct < cfg["admit_floor_pct"]:
+        return False, f"memory: the Mac has {mem['level']:.0f}% free, need {fmt_gb(req_mem)}"
+    if not running and mem["level"] < cfg["soft_pct"]:
+        return False, f"memory: the Mac has only {mem['level']:.0f}% free"
+    return True, ""
+
+
+def cmd_run(argv):
+    cfg = load_config()
+    mem_arg = cpu_arg = None
+    name = None
+    while argv and argv[0] != "--":
+        flag = argv.pop(0)
+        if flag == "--mem":
+            mem_arg = parse_size(argv.pop(0))
+        elif flag == "--cpu":
+            cpu_arg = int(argv.pop(0))
+        elif flag == "--name":
+            name = argv.pop(0)
+        else:
+            argv.insert(0, flag)
+            break
+    if argv and argv[0] == "--":
+        argv.pop(0)
+    if not argv:
+        sys.stderr.write("usage: headroom run [--mem 4G] [--cpu 8] [--name X] -- <command…>\n")
+        return 2
+    if os.environ.get("HEADROOM_JOB"):  # nested: the outer job already holds the reservation
+        return subprocess.call(argv)
+
+    sig = name or signature(argv)
+    learned = learned_mem(sig)
+    # The prior (--mem, or the default) is a floor: one trivial run (`pytest --version`) must not
+    # shrink the next full suite's reservation. Learning only ever raises it.
+    req_mem = max(learned or 0, mem_arg or int(cfg["default_mem_gb"] * GiB))
+    req_mem = min(req_mem, int(cfg["job_cap_pct"] / 100 * TOTAL))
+    req_cpu = min(cpu_arg or cfg["default_cpu"], cfg["cpus"])
+    label = " ".join(argv)[:160]
+
+    ticket = path("queue", f"{time.time_ns()}-{os.getpid()}.json")
+    write_json(ticket, {"pid": os.getpid(), "mem": req_mem, "cpu": req_cpu, "label": label,
+                        "since": time.time()})
+    started, said, reason = time.time(), 0.0, ""
+    try:
+        while True:
+            with Ledger():
+                queue = tickets()
+                if queue and queue[0]["pid"] == os.getpid():
+                    ok, reason = fits(req_mem, req_cpu, cfg, jobs())
+                    if ok:
+                        os.unlink(ticket)
+                        break
+                else:
+                    ahead = next(i for i, t in enumerate(queue) if t["pid"] == os.getpid())
+                    reason = f"{ahead} job(s) ahead in the queue"
+            now = time.time()
+            if now - said >= 30:
+                sys.stderr.write(f"[headroom] waiting {int(now - started)}s — {reason}"
+                                 " (`headroom status`)\n")
+                sys.stderr.flush()
+                said = now
+            time.sleep(1)
+    except KeyboardInterrupt:
+        os.unlink(ticket)
+        return 130
+    if said:
+        sys.stderr.write(f"[headroom] started after {int(time.time() - started)}s\n")
+
+    nice = cfg["nice"]
+    env = dict(os.environ, HEADROOM_JOB=str(os.getpid()))
+    child = subprocess.Popen(argv, env=env, preexec_fn=lambda: os.nice(nice))
+    job = {"pid": os.getpid(), "child": child.pid, "mem": req_mem, "cpu": req_cpu, "sig": sig,
+           "label": label, "started": time.time(), "state": "running"}
+    write_json(job_path(os.getpid()), job)
+
+    def forward(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, forward)
+
+    peak, state = 0, "running"
+    while child.poll() is None:
+        kids = children_map(process_table())
+        peak = max(peak, tree_footprint(child.pid, kids))
+        cur = (read_json(job_path(os.getpid()), {}) or {}).get("state", "running")
+        if cur != state:
+            msg = {"paused": "paused: the Mac is low on memory; will resume automatically",
+                   "running": "resumed"}.get(cur, cur)
+            sys.stderr.write(f"[headroom] {msg}\n")
+            sys.stderr.flush()
+            state = cur
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    code = child.returncode
+    try:
+        os.unlink(job_path(os.getpid()))
+    except OSError:
+        pass
+    killed = read_json(path("killed", f"{os.getpid()}.json"))
+    if killed:
+        os.unlink(path("killed", f"{os.getpid()}.json"))
+        sys.stderr.write(f"[headroom] killed by the memory guard: {killed['why']}\n")
+        return 137
+    if code == 0 and peak:
+        remember_peak(sig, peak)
+    return code if code >= 0 else 128 - code
+
+
+# ---------------------------------------------------------------- the guard
+
+
+class Guard:
+    def __init__(self):
+        self.cfg = load_config()
+        self.cooldown_until = 0.0
+        self.last_notice = {}
+
+    def say(self, key, text, every=60):
+        log_event("notice", text=text)
+        if time.time() - self.last_notice.get(key, 0) >= every:
+            self.last_notice[key] = time.time()
+            notify(self.cfg, text)
+
+    def kill_tree(self, pids, why, job=None):
+        if job:
+            write_json(path("killed", f"{job['pid']}.json"), {"why": why})
+        signal_all(pids, signal.SIGCONT)
+        signal_all(pids, signal.SIGTERM)
+        deadline = time.time() + 3
+        while time.time() < deadline and any(alive(p) for p in pids):
+            time.sleep(0.2)
+        signal_all([p for p in pids if alive(p)], signal.SIGKILL)
+        log_event("kill", why=why, pids=pids[:20], job=job and job["label"])
+
+    def set_state(self, job, state):
+        job["state"] = state
+        job["state_since"] = time.time()
+        write_json(job_path(job["pid"]), {k: v for k, v in job.items() if k not in ("tree", "fp")})
+
+    def tick(self):
+        cfg = self.cfg = load_config()
+        mem = memory()
+        table = process_table()
+        kids = children_map(table)
+        with Ledger():
+            running = jobs()
+        job_pids = {}
+        for j in running:
+            tree = [j["child"]] + descendants(j["child"], kids)
+            j["tree"] = tree
+            j["fp"] = sum(footprint(p) for p in tree)
+            for p in tree:
+                job_pids[p] = j
+
+        cap = cfg["job_cap_pct"] / 100 * TOTAL
+        for j in running:
+            if j["fp"] > cap:
+                why = f"used {fmt_gb(j['fp'])}, over the per-job cap {fmt_gb(cap)}"
+                self.kill_tree(j["tree"], why, j)
+                self.say("cap", f"Stopped a runaway job ({why}): {j['label'][:60]}", every=0)
+                return
+
+        # Runaway: any process an agent app spawned, inside a job or not.
+        runaway = cfg["runaway_pct"] / 100 * TOTAL
+        sizes, agent_total = agent_view(cfg, table, kids)
+        budget = cfg["agent_budget_pct"] / 100 * TOTAL
+        for p, fp in sizes.items():
+            if fp > runaway:
+                name = os.path.basename(table[p][2])
+                why = f"{name} (pid {p}) reached {fmt_gb(fp)}, over the runaway limit {fmt_gb(runaway)}"
+                job = job_pids.get(p)
+                self.kill_tree([p] + descendants(p, kids), why, job)
+                self.say("runaway", f"Stopped a runaway process: {why}", every=0)
+                return
+
+        if time.time() < self.cooldown_until:
+            return
+        level, pressure = mem["level"], mem["pressure"]
+        active = [j for j in running if j.get("state") != "paused"]
+        paused = [j for j in running if j.get("state") == "paused"]
+
+        kernel_hard = level < cfg["hard_pct"] or pressure >= 4
+        over_hard = kernel_hard or agent_total > budget * 1.15
+        over_soft = level < cfg["soft_pct"] or agent_total > budget
+        relaxed = level > cfg["resume_pct"] and agent_total < budget * 0.85
+        state = f"{level:.0f}% free, agents {fmt_gb(agent_total)} of {fmt_gb(budget)}"
+        if over_hard:
+            # Over budget: only queued jobs are fair game (the budget is a policy). The whole
+            # Mac about to run out: the largest thing any agent started, queued or not.
+            cands = [(j["fp"], j["tree"], j, j["label"]) for j in running]
+            if kernel_hard:
+                cands += [(fp, [p] + descendants(p, kids), None, os.path.basename(table[p][2]))
+                          for p, fp in sizes.items() if fp > 1 * GiB and p not in job_pids]
+            if cands:
+                fp, tree, job, what = max(cands, key=lambda c: c[0])
+                why = f"memory critical ({state}); this used {fmt_gb(fp)}"
+                self.kill_tree(tree, why, job)
+                self.say("hard", f"Memory critical — stopped the largest agent task ({fmt_gb(fp)}): {what[:60]}", 0)
+            elif kernel_hard:
+                self.say("hard-none", f"Memory critical ({state}) and nothing an "
+                         "agent started is large; check Docker and open apps.", 300)
+            self.cooldown_until = time.time() + 8
+        elif over_soft and paused and time.time() - paused[-1].get("state_since", 0) > cfg["pause_max_s"]:
+            j = paused[-1]
+            why = (f"paused {int(cfg['pause_max_s'])}s and memory never came back ({state});"
+                   " retry when the Mac is less busy")
+            self.kill_tree(j["tree"], why, j)
+            self.say("pause-kill", f"Gave up on a paused job: {j['label'][:60]}", 0)
+            self.cooldown_until = time.time() + 5
+        elif over_soft and active:
+            victim = active[-1]  # newest: least work lost, and the likeliest cause
+            signal_all(victim["tree"], signal.SIGSTOP)
+            self.set_state(victim, "paused")
+            log_event("pause", job=victim["label"], why=state)
+            self.say("pause", f"Low memory ({state}) — paused: {victim['label'][:60]}")
+            self.cooldown_until = time.time() + 5
+        elif relaxed and paused:
+            j = paused[0]
+            signal_all(j["tree"], signal.SIGCONT)
+            self.set_state(j, "running")
+            log_event("resume", job=j["label"], why=state)
+            self.cooldown_until = time.time() + 10
+
+    def loop(self):
+        log_event("daemon-start", version=VERSION, pid=os.getpid())
+        while True:
+            try:
+                self.tick()
+            except Exception as e:  # the guard must outlive any single bad reading
+                log_event("error", error=repr(e))
+            time.sleep(self.cfg.get("tick_s", 1.0))
+
+
+# ---------------------------------------------------------------- status / install
+
+
+def cmd_status():
+    cfg = load_config()
+    mem = memory()
+    pressure = {1: "normal", 2: "warning", 4: "critical"}.get(mem["pressure"], mem["pressure"])
+    guard = "running" if guard_pid() else "NOT running (headroom install)"
+    print(f"memory  {mem['level']:.0f}% free (kernel)  ·  {mem['strict']:.0f}% free (strict)"
+          f"  ·  pressure {pressure}  ·  RAM {fmt_gb(TOTAL)}")
+    table = process_table()
+    _, agent_total = agent_view(cfg, table, children_map(table))
+    print(f"agents  {fmt_gb(agent_total)} of {fmt_gb(cfg['agent_budget_pct'] / 100 * TOTAL)} budget"
+          " (agent apps + everything they started)")
+    print(f"cpu     load {os.getloadavg()[0]:.1f} on {cfg['cpus']} cores")
+    print(f"guard   {guard}")
+    with Ledger():
+        running, queue = jobs(), tickets()
+    kids = children_map(process_table())
+    print(f"jobs    {len(running)} running/paused, {len(queue)} queued")
+    for j in running:
+        age = int(time.time() - j["started"])
+        print(f"  {j['state']:<7} {fmt_gb(tree_footprint(j['child'], kids)):>6} of "
+              f"{fmt_gb(j['mem'])} reserved, {j['cpu']} cpu, {age}s  {j['label'][:70]}")
+    for t in queue:
+        print(f"  queued  needs {fmt_gb(t['mem'])}, {t['cpu']} cpu, "
+              f"{int(time.time() - t['since'])}s  {t['label'][:70]}")
+    try:
+        with open(path("events.log")) as f:
+            events = [json.loads(line) for line in f.readlines()[-200:]]
+    except OSError:
+        events = []
+    recent = [e for e in events if e["kind"] in ("kill", "pause", "resume")][-5:]
+    if recent:
+        print("recent")
+        for e in recent:
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(e["t"]))
+            print(f"  {stamp} {e['kind']:<6} {(e.get('why') or e.get('job') or '')[:90]}")
+    return 0
+
+
+def guard_pid():
+    out = subprocess.run(["launchctl", "list", LABEL], capture_output=True, text=True).stdout
+    m = re.search(r'"PID" = (\d+);', out)
+    return int(m.group(1)) if m else None
+
+
+def cmd_install():
+    src = os.path.realpath(__file__)
+    bindir = os.path.expanduser("~/.local/bin")
+    os.makedirs(bindir, exist_ok=True)
+    target = os.path.join(bindir, "headroom")
+    if os.path.realpath(target) != src:
+        if os.path.lexists(target):
+            os.unlink(target)
+        os.symlink(src, target)
+    python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    logf = os.path.expanduser("~/Library/Logs/headroom.log")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>{python}</string><string>{src}</string><string>daemon</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>Nice</key><integer>-5</integer>
+  <key>StandardOutPath</key><string>{logf}</string>
+  <key>StandardErrorPath</key><string>{logf}</string>
+</dict></plist>
+"""
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    with open(PLIST, "w") as f:
+        f.write(plist)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", domain, PLIST], check=True)
+    time.sleep(1.5)
+    print(f"installed: {target} -> {src}")
+    print(f"guard:     {PLIST} (pid {guard_pid()})")
+    return 0
+
+
+def cmd_uninstall():
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    if os.path.exists(PLIST):
+        os.unlink(PLIST)
+    print("guard removed")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "daemon":
+        Guard().loop()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "install":
+        return cmd_install()
+    if cmd == "uninstall":
+        return cmd_uninstall()
+    if cmd == "--version":
+        print(VERSION)
+        return 0
+    # `headroom <cmd…>` is shorthand for `headroom run -- <cmd…>`
+    return cmd_run(["--"] + argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
