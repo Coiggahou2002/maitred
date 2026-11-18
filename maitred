@@ -63,6 +63,10 @@ DEFAULTS = {
     # the guard pauses the newest job below soft, resumes above resume, kills below hard.
     "admit_floor_pct": 20,
     "soft_pct": 15,
+    # Below soft_pct, pause only when agent work is at least this share of its budget. Under it,
+    # the shortage comes from the apps themselves (each agent session keeps its own MCP servers
+    # resident); pausing and then killing a job frees almost nothing and just loses the run.
+    "soft_blame_pct": 50,
     "resume_pct": 25,
     "hard_pct": 8,
     # One job's whole process tree may not exceed this.
@@ -587,8 +591,9 @@ class Guard:
 
         kernel_hard = level < cfg["hard_pct"] or pressure >= 4
         over_hard = kernel_hard or work > budget * 1.15
-        over_soft = level < cfg["soft_pct"] or work > budget
-        relaxed = level > cfg["resume_pct"] and work < budget * 0.85
+        blame = budget * cfg["soft_blame_pct"] / 100
+        over_soft = work > budget or (level < cfg["soft_pct"] and work >= blame)
+        relaxed = work < budget * 0.85 and (level > cfg["resume_pct"] or work < blame * 0.85)
         state = f"{level:.0f}% free, agent work {fmt_gb(work)} of {fmt_gb(budget)}"
         if over_hard:
             # Queued jobs first, at any size. Unqueued agent processes too, once they are big

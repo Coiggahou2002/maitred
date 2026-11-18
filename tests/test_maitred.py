@@ -165,6 +165,27 @@ class Guard(Base):
         self.assertIn("paused", err)
         self.assertIn("memory never came back", err)
 
+    def test_low_memory_not_caused_by_agents_does_not_pause(self):
+        # The Mac is short (10 % free) but agent work is far under half its budget: the apps
+        # themselves are the cause, so the job runs to the end instead of being paused and killed.
+        self.config(agent_budget_pct=90, admit_floor_pct=0, pause_max_s=2)
+        self.daemon = self.run_bg("daemon", extra_env={"MAITRED_FAKE_LEVEL": "10"})
+        p = self.run_bg("run", "--mem", "1G", "--", sys.executable, "-c", HOG, "1", "5")
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertNotIn("paused", err)
+
+    def test_low_memory_with_agents_near_budget_pauses(self):
+        base = self.agent_total()
+        hr = load()
+        self.config(agent_budget_pct=100 * (base + 4 * GiB) / hr.TOTAL, admit_floor_pct=0,
+                    pause_max_s=3)
+        self.daemon = self.run_bg("daemon", extra_env={"MAITRED_FAKE_LEVEL": "10"})
+        p = self.run_bg("run", "--mem", "1G", "--", sys.executable, "-c", HOG, "3", "30")
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 137, err)
+        self.assertIn("memory never came back", err)
+
     def test_far_over_budget_kills_the_job(self):
         base = self.agent_total()
         hr = load()

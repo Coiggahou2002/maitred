@@ -64,8 +64,8 @@ smaller figure. When several rules apply, the first row that matches wins.
 |---|---|
 | one queued job's whole process tree passes 30 % of RAM | kills it, and the job says why |
 | one process started by an agent app grows past 22 % of RAM | kills it and sends a notification. A test runner at 246 GB is never legitimate |
-| everything agents started passes its budget (40 % of RAM), or the Mac drops below 15 % free | pauses the newest job (`SIGSTOP`) and starts nothing new |
-| work falls back under 85 % of budget and the Mac is above 25 % free | resumes the paused job |
+| everything agents started passes its budget (40 % of RAM), or the Mac drops below 15 % free while agent work is at least half its budget | pauses the newest job (`SIGSTOP`) and starts nothing new |
+| work falls back under 85 % of budget and the Mac is above 25 % free (or agent work is well under half its budget) | resumes the paused job |
 | a job stays paused for 3 minutes and memory never comes back | kills it, so it stops holding memory |
 | agent work passes 115 % of budget | kills enough of the largest agent tasks, queued or not, to get back under budget in one step |
 | the Mac drops below 8 % free, or the kernel reports critical pressure | kills the largest things agents started, 1 GB and up |
@@ -126,7 +126,7 @@ second, or in `MAITRED_<KEY>` environment variables:
   "agent_budget_pct": 40,
   "runaway_pct": 22,
   "job_cap_pct": 30,
-  "soft_pct": 15, "resume_pct": 25, "hard_pct": 8,
+  "soft_pct": 15, "soft_blame_pct": 50, "resume_pct": 25, "hard_pct": 8,
   "admit_floor_pct": 20,
   "default_cpu": 8, "default_mem_gb": 2,
   "pause_max_s": 180,
